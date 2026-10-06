@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="nl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+body{font:13px system-ui,sans-serif;margin:0;padding:10px;background:#fff;color:#222}
+.r{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+input,select,button,textarea{font:inherit;padding:4px 6px;border:1px solid #aaa;border-radius:4px}
+input[type=number]{width:75px}
+button{background:#0079c1;color:#fff;border:0;cursor:pointer;padding:5px 12px}
+textarea{width:100%;height:50px;box-sizing:border-box;display:none}
+#w{position:relative;height:300px}
+table{border-collapse:collapse;margin-top:8px;width:100%;max-width:520px}
+th,td{padding:4px 8px;border-bottom:1px solid #ddd;text-align:right}
+th:first-child,td:first-child{text-align:left}
+#m{color:#c00}
+</style></head><body>
+<div class="r">
+<input type="file" id="f" accept=".csv,.txt">
+<a href="#" onclick="p.style.display='block';return false">of plak CSV</a>
+</div>
+<textarea id="p" placeholder="id;afstand;bagger;bodem" oninput="laad(this.value)"></textarea>
+<div class="r">
+<label>Profiel <select id="s" onchange="teken()"></select></label>
+<label>Legger (cm) <input id="ld" type="number" value="100"></label>
+<label>Lengte (m) <input id="L" type="number" value="50"></label>
+<button onclick="teken()">Bereken</button>
+<span id="m">Kies een CSV: id;afstand(m);bagger(cm);bodem(cm)</span>
+</div>
+<div id="w"><canvas id="c"></canvas></div>
+<table id="t"></table>
+<script>
+let G={},ch;
+const $=i=>document.getElementById(i),lerp=(a,b,t)=>a+(b-a)*t;
+$('f').onchange=e=>{
+  const r=new FileReader();
+  r.onload=()=>laad(r.result);
+  r.readAsText(e.target.files[0]);
+};
+function laad(tx){
+  const d=tx.includes(';')?';':tx.includes('\t')?'\t':',';
+  G={};
+  tx.trim().split(/\r?\n/).forEach(l=>{
+    let a=l.split(d).map(s=>s.trim());
+    if(d!=',')a=a.map(s=>s.replace(',','.'));
+    const n=a.slice(-3).map(Number);
+    if(a.length<3||n.some(v=>!isFinite(v)||a.slice(-3)[0]===''))return;
+    const id=a.length>3?a[0]:'1';
+    (G[id]=G[id]||[]).push({af:n[0],bag:n[1],bod:n[2]});
+  });
+  const k=Object.keys(G);
+  k.forEach(i=>G[i].sort((a,b)=>a.af-b.af));
+  $('s').innerHTML=k.map(i=>`<option>${i}</option>`).join('');
+  $('m').textContent=k.length?k.length+' profiel(en) geladen':'Geen geldige data';
+  teken();
+}
+function verfijn(P,c){
+  if(!isFinite(c))return P;
+  const o=[];
+  for(let i=0;i<P.length;i++){
+    o.push(P[i]);
+    if(i==P.length-1)break;
+    const a=P[i],b=P[i+1],ts=[];
+    ['bag','bod'].forEach(k=>{
+      const x=a[k]-c,y=b[k]-c;
+      if((x>0)!==(y>0)&&x!==y)ts.push(x/(x-y));
+    });
+    ts.sort((x,y)=>x-y).forEach(t=>o.push({af:lerp(a.af,b.af,t),bag:lerp(a.bag,b.bag,t),bod:lerp(a.bod,b.bod,t)}));
+  }
+  return o;
+}
+function h(p,z,c){
+  const t=Math.min(p.bag,p.bod),b=Math.max(p.bag,p.bod),u=isFinite(c)?c:1e9;
+  if(z=='w')return Math.max(0,Math.min(t,u));
+  if(z=='b')return Math.max(0,Math.min(b,u)-Math.min(t,u));
+  return isFinite(c)?Math.max(0,c-Math.min(b,c)):0;
+}
+function opp(P,z,c){
+  const r=verfijn(P,c);let s=0;
+  for(let i=1;i<r.length;i++)s+=(h(r[i-1],z,c)+h(r[i],z,c))/2*(r[i].af-r[i-1].af);
+  return s/100;
+}
+function teken(){
+  const P=G[$('s').value];
+  if(!P||P.length<2)return;
+  const ld=parseFloat($('ld').value),L=parseFloat($('L').value);
+  const x0=P[0].af,x1=P[P.length-1].af;
+  const ds=[
+    {label:'Waterpeil',data:[{x:x0,y:0},{x:x1,y:0}],borderColor:'#3987e5',borderDash:[6,4],pointRadius:0},
+    {label:'Bovenkant bagger',data:P.map(p=>({x:p.af,y:Math.min(p.bag,p.bod)})),borderColor:'#d95926',backgroundColor:'rgba(217,89,38,.3)',fill:{target:2}},
+    {label:'Vaste bodem',data:P.map(p=>({x:p.af,y:Math.max(p.bag,p.bod)})),borderColor:'#199e70',backgroundColor:'rgba(25,158,112,.2)',fill:'end'}
+  ];
+  if(isFinite(ld))ds.push({label:'Legger',data:[{x:x0,y:ld},{x:x1,y:ld}],borderColor:'#e6a800',borderDash:[2,3],pointRadius:0});
+  if(ch)ch.destroy();
+  ch=new Chart($('c'),{type:'line',data:{datasets:ds},options:{
+    responsive:true,maintainAspectRatio:false,
+    scales:{x:{type:'linear',title:{display:true,text:'Afstand (m)'}},
+            y:{reverse:true,title:{display:true,text:'Diepte (cm)'}}}}});
+  const f=v=>v.toLocaleString('nl-NL',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const R=(n,z,c)=>{const a=opp(P,z,c);return`<tr><td>${n}</td><td>${f(a)}</td><td>${isFinite(L)?f(a*L):'-'}</td></tr>`};
+  let H='<tr><th>Zone</th><th>m²/m¹</th><th>Volume m³</th></tr>'+R('Water totaal','w',NaN)+R('Bagger totaal','b',NaN);
+  if(isFinite(ld))H+=R('Water boven legger','w',ld)+R('Bagger boven legger','b',ld)+R('Vaste bodem boven legger','v',ld);
+  $('t').innerHTML=H;
+}
+</script></body></html>
