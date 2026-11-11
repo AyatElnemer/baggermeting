@@ -197,7 +197,9 @@ input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var
     </select>
   </label>
   <button class="btn btn-sm" onclick="openAanwasOverlay()" title="Optioneel: reken een verwachte bagger-aanwas (opslibbing) tot een toekomstige datum mee in alle volumes/toetsregels/grafieken, op basis van een staffel breedteklasses."><i class="ti ti-trending-up" aria-hidden="true"></i>Aanwas<span id="aanwas-actief-badge" style="display:none;margin-left:5px;background:var(--accent);color:#fff;border-radius:9px;padding:1px 6px;font-size:10.5px">aan</span></button>
+  <button class="btn btn-sm" onclick="fsOpenDialog()" title="Metingen rechtstreeks lezen uit en terugschrijven naar een tabel van een ArcGIS feature service"><i class="ti ti-database" aria-hidden="true"></i>Feature service</button>
   <div style="flex:1"></div>
+  <span id="fs-indicator" style="font-size:11px;color:var(--text-m);margin-right:10px">Feature service: niet verbonden</span>
   <span id="autosave-indicator" style="font-size:11px;color:var(--text-m)" title="De tool slaat wijzigingen automatisch op in deze browser, zodat een herlaad (F5) of ongeluk niets kost. Voor delen met collega's of een andere computer: gebruik 'Project opslaan'.">Nog niet automatisch opgeslagen</span>
 </div>
 
@@ -826,6 +828,29 @@ input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var
   </div>
 </div>
 
+<div id="fs-overlay" class="detail-overlay" onclick="if(event.target===this)fsCloseDialog()">
+  <div class="detail-card" style="max-width:600px">
+    <button class="detail-close no-print" onclick="fsCloseDialog()"><i class="ti ti-x" aria-hidden="true"></i></button>
+    <div style="font-size:17px;font-weight:500;color:var(--text-p)">Feature service-koppeling</div>
+    <div style="font-size:12px;color:var(--text-m);margin:4px 0 16px">De tool leest de metingen rechtstreeks uit de tabel van een ArcGIS feature service en schrijft elke wijziging (nieuw, bewerkt, verwijderd) terug. Eén rij per meetpunt, met dezelfde kolommen als de CSV-/XLSX-template.</div>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <div><label>URL van de tabel (eindigt op /FeatureServer/&lt;nummer&gt;)</label><input id="fs-url" type="text" placeholder="https://services.arcgis.com/…/arcgis/rest/services/…/FeatureServer/0"></div>
+      <div><label>Client ID van je ArcGIS-app (voor aanmelden; leeg laten bij een openbare service)</label><input id="fs-client" type="text" placeholder="bijv. aBcD1234eFgH5678"></div>
+      <div><label>Portal-URL</label><input id="fs-portal" type="text" placeholder="https://www.arcgis.com"></div>
+      <div><label>Token (optioneel, alternatief voor aanmelden)</label><input id="fs-token" type="password" autocomplete="off" placeholder="plak hier eventueel een token"></div>
+      <div style="font-size:12px;color:var(--text-m)">Redirect-URI om te registreren bij je ArcGIS-app: <code id="fs-redirect" style="user-select:all"></code></div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="fs-auto" checked>Wijzigingen automatisch terugschrijven (na ± 1,5 s)</label>
+    </div>
+    <div id="fs-dialog-msg" style="font-size:12px;margin-top:12px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="fsDialogConnect()"><i class="ti ti-plug-connected" aria-hidden="true"></i>Verbinden &amp; laden</button>
+      <button class="btn" onclick="fsDialogSyncNow()"><i class="ti ti-refresh" aria-hidden="true"></i>Nu synchroniseren</button>
+      <button class="btn" onclick="fsDialogReload()"><i class="ti ti-download" aria-hidden="true"></i>Opnieuw laden uit service</button>
+      <button class="btn" onclick="fsDialogDisconnect()">Verbinding verbreken</button>
+    </div>
+  </div>
+</div>
+
 <div id="metfile-import-overlay" class="detail-overlay" onclick="overlayMetfileImportClick(event)">
   <div class="detail-card" style="max-width:520px">
     <button class="detail-close no-print" onclick="closeMetfileImport()"><i class="ti ti-x" aria-hidden="true"></i></button>
@@ -888,6 +913,22 @@ input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var
     </div>
   </div>
 </div>
+
+<script>
+// OAuth-terugkeerpagina: als deze pagina als popup na het aanmelden bij ArcGIS terugkomt
+// (token in de #hash), geef het token door aan het venster dat de popup opende en sluit.
+(function(){
+  try{
+    if(window.opener&&window.opener!==window&&/[#&](access_token|error)=/.test(location.hash)){
+      var p=new URLSearchParams(location.hash.replace(/^#/,''));
+      window.__fsOauthPopup=true;
+      window.opener.postMessage({type:'fs-oauth',token:p.get('access_token'),expires:Number(p.get('expires_in'))||0,error:p.get('error_description')||p.get('error')||''},location.origin);
+      document.title='Aangemeld';
+      window.close();
+    }
+  }catch(e){}
+})();
+</script>
 
 <script>
 // ════════════════════════════════════════
@@ -3778,6 +3819,7 @@ function herstelProjectSnapshot(staat){
 let _autosaveTimer=null;
 let _autosaveGereed=false; // pas true na de opstart-herstelpoging, voorkomt dat de allereerste (nog lege) render de zojuist herstelde sessie overschrijft
 function scheduleAutosave(){
+  if(typeof fsScheduleSync==='function')fsScheduleSync();
   if(!_autosaveGereed)return;
   if(_autosaveTimer)clearTimeout(_autosaveTimer);
   _autosaveTimer=setTimeout(()=>{_autosaveTimer=null;autosaveNu();},800);
@@ -4906,7 +4948,8 @@ function renderSelectionBar(){
 }
 
 function deleteMeeting(mid){
-  if(!confirm('Meting verwijderen?'))return;
+  if(!confirm('Meting verwijderen?'+(fsConnected?' Dit verwijdert de meting ook uit de feature service.':'')))return;
+  fsQueueDelete(meetings.find(m=>m.meta.id===mid));
   meetings=meetings.filter(m=>m.meta.id!==mid);
   selectedIds.delete(mid);
   renderAll();
@@ -7550,7 +7593,7 @@ function parseCSV(rows){
   }
   for(const id of validIds){
     const idx=meetings.findIndex(m=>m.meta.id===id);
-    if(idx>=0)meetings[idx]=groups[id];else meetings.push(groups[id]);
+    if(idx>=0){fsCarryRemote(meetings[idx],groups[id]);meetings[idx]=groups[id];}else meetings.push(groups[id]);
   }
   const extras=[];
   if(gpsUsed)extras.push(`${gpsUsed} via GPS-coördinaten omgerekend`);
@@ -8075,7 +8118,7 @@ function runXlsxImport(){
     if(g.oeverPts&&g.oeverPts.length)withOever++;
     if(g.meta.waterlijnVerplaatst)verplaatst++;
     const idx=meetings.findIndex(m=>m.meta.id===id);
-    if(idx>=0)meetings[idx]=g;else meetings.push(g);
+    if(idx>=0){fsCarryRemote(meetings[idx],g);meetings[idx]=g;}else meetings.push(g);
     added++;
     addedIds.push(id);
   });
@@ -8412,8 +8455,426 @@ function exportVolumesExcel(){
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`baggermeting_volumes_${ds}.xls`;a.click();URL.revokeObjectURL(a.href);
 }
 
-renderAll();
-probeerAutosaveTeHerstellen();
+// ════════════════════════════════════════
+// FEATURE SERVICE-KOPPELING (ArcGIS REST API)
+// Leest de metingen rechtstreeks uit een tabel van een feature service en schrijft elke
+// wijziging terug. Platte tabel: één rij per meetpunt, met dezelfde kolommen als de
+// CSV-/XLSX-template (MeetingID, Projectnaam, …, Afstand_m, BovenkantBagger_cm, VasteBodem_cm).
+// Werkt zonder extra bibliotheken: alleen fetch + de ArcGIS REST-endpoints query/applyEdits.
+// ════════════════════════════════════════
+const FS_CFG_KEY='baggermeting_fs_cfg',FS_TOKEN_KEY='baggermeting_fs_token',FS_DEFAULT_PORTAL='https://www.arcgis.com';
+let fsCfg={url:'',portal:FS_DEFAULT_PORTAL,clientId:'',token:'',tokenExp:0,autoSync:true};
+let fsF={},fsTypes={},fsOid='OBJECTID',fsCanEdit=false,fsPageSize=1000,fsMissingOptional=[];
+let fsConnected=false,fsLoading=false,fsBusy=false,fsRerun=false,fsTimer=null,fsDirty=false,fsLastSync=null;
+let fsPendingDeletes=[];
+class FsAuthError extends Error{}
+
+// Kolomnamen worden hoofdletter- en leesteken-onafhankelijk herkend (zelfde aliassen als de CSV-import).
+const FS_FIELD_DEFS={
+  id:['meetingid'],project:['projectnaam','project'],locatie:['locatie'],datum:['datum'],
+  ws:['waterpeilmnap','waterpeil','opnamepeil'],sp:['schouwpeilmnap','schouwpeil'],
+  ld:['leggerdieptecm','leggerdiepte'],ldTal:['leggertalud1n','leggertalud','taludlegger'],
+  od:['onderhoudsdieptecm','onderhoudsdiepte'],odTal:['onderhoudtalud1n','onderhoudstalud1n','onderhoudtalud','taludonderhoud'],
+  slootl:['slootlengtem','slootlengte'],
+  x0:['xbeginrd','xbegin'],y0:['ybeginrd','ybegin'],x1:['xeindrd','xeind'],y1:['yeindrd','yeind'],
+  soort:['soort'],linkMode:['koppelmethode','linkmode'],linkedId:['gekoppeldaanid','linkedid','gekoppeldaan'],
+  bodemBron:['bodembron'],clip:['clipbagvastebodem','baggerclippenopvastebodem'],watertype:['watertype'],
+  af:['afstandm','afstand'],bag:['bovenkantbaggercm','bovenkantbagger'],bod:['vastebodemcm','vastebodem'],
+  oever:['oeverptsjson','oeverjson']
+};
+const FS_REQUIRED=['id','af','bag','bod'];
+const FS_OPTIONAL_LABELS={clip:'ClipBagVasteBodem',watertype:'Watertype',oever:'OeverPts_JSON'};
+const fsNorm=s=>String(s==null?'':s).toLowerCase().replace(/[^a-z0-9]/g,'');
+const fsNum=v=>(v===null||v===undefined||v==='')?NaN:Number(v);
+const fsOutNum=v=>(typeof v==='number'&&isFinite(v))?v:null;
+const fsStr=v=>(v===null||v===undefined)?'':String(v).trim();
+const fsChunk=(arr,n)=>{const o=[];for(let i=0;i<arr.length;i+=n)o.push(arr.slice(i,i+n));return o;};
+const fsEsc=s=>String(s).replace(/'/g,"''");
+function fsHash(str){let h1=0xdeadbeef,h2=0x41c6ce57;for(let i=0,ch;i<str.length;i++){ch=str.charCodeAt(i);h1=Math.imul(h1^ch,2654435761);h2=Math.imul(h2^ch,1597334677);}h1=Math.imul(h1^(h1>>>16),2246822507)^Math.imul(h2^(h2>>>13),3266489909);h2=Math.imul(h2^(h2>>>16),2246822507)^Math.imul(h1^(h1>>>13),3266489909);return(4294967296*(2097151&h2)+(h1>>>0)).toString(36)+'-'+str.length;}
+function fsInList(ids){return fsF.id+' IN ('+ids.map(i=>"'"+fsEsc(i)+"'").join(',')+')';}
+
+// ── Instellingen (URL-parameters ?service=…&clientId=…&portal=… hebben voorrang) ──
+function fsLoadCfg(){
+  try{const s=JSON.parse(localStorage.getItem(FS_CFG_KEY)||'{}');fsCfg.url=s.url||'';fsCfg.portal=s.portal||FS_DEFAULT_PORTAL;fsCfg.clientId=s.clientId||'';fsCfg.autoSync=s.autoSync!==false;}catch(e){}
+  try{const t=JSON.parse(sessionStorage.getItem(FS_TOKEN_KEY)||'null');if(t&&t.token&&(!t.exp||t.exp>Date.now())){fsCfg.token=t.token;fsCfg.tokenExp=t.exp||0;}}catch(e){}
+  try{
+    const q=new URLSearchParams(location.search);
+    if(q.get('service'))fsCfg.url=q.get('service');
+    if(q.get('portal'))fsCfg.portal=q.get('portal');
+    if(q.get('clientId'))fsCfg.clientId=q.get('clientId');
+    if(q.get('autosync')==='0')fsCfg.autoSync=false;
+  }catch(e){}
+}
+function fsSaveCfg(){try{localStorage.setItem(FS_CFG_KEY,JSON.stringify({url:fsCfg.url,portal:fsCfg.portal,clientId:fsCfg.clientId,autoSync:fsCfg.autoSync}));}catch(e){}}
+function fsSaveToken(){try{sessionStorage.setItem(FS_TOKEN_KEY,JSON.stringify({token:fsCfg.token,exp:fsCfg.tokenExp}));}catch(e){}}
+
+// ── Aanmelden (OAuth 2.0, popup) ──
+function fsLogin(){
+  return new Promise((resolve,reject)=>{
+    if(!fsCfg.clientId){reject(new Error('Deze service vereist aanmelden. Vul een Client ID in (of plak een token).'));return;}
+    const redirect=location.origin+location.pathname;
+    const u=fsCfg.portal.replace(/\/+$/,'')+'/sharing/rest/oauth2/authorize?client_id='+encodeURIComponent(fsCfg.clientId)+'&response_type=token&expiration=120&redirect_uri='+encodeURIComponent(redirect);
+    const w=window.open(u,'fs_oauth','width=600,height=700');
+    if(!w){reject(new Error('Het aanmeldvenster werd geblokkeerd. Sta pop-ups toe voor deze pagina en probeer opnieuw.'));return;}
+    let poll=null;
+    const onMsg=ev=>{
+      if(ev.origin!==location.origin||!ev.data||ev.data.type!=='fs-oauth')return;
+      window.removeEventListener('message',onMsg);clearInterval(poll);
+      if(ev.data.token){
+        fsCfg.token=ev.data.token;fsCfg.tokenExp=ev.data.expires?Date.now()+ev.data.expires*1000:0;fsSaveToken();resolve();
+      }else reject(new Error('Aanmelden mislukt: '+(ev.data.error||'onbekende reden')));
+    };
+    window.addEventListener('message',onMsg);
+    poll=setInterval(()=>{if(w.closed){clearInterval(poll);setTimeout(()=>{window.removeEventListener('message',onMsg);},1000);reject(new Error('Aanmeldvenster gesloten zonder aan te melden.'));}},700);
+  });
+}
+
+// ── REST ──
+async function fsRequest(path,params){
+  if(fsCfg.token&&fsCfg.tokenExp&&Date.now()>fsCfg.tokenExp-60000)fsCfg.token='';
+  const body=new URLSearchParams();body.set('f','json');
+  Object.keys(params||{}).forEach(k=>{if(params[k]!==undefined&&params[k]!==null)body.set(k,params[k]);});
+  if(fsCfg.token)body.set('token',fsCfg.token);
+  let res;
+  try{res=await fetch(fsCfg.url.replace(/\/+$/,'')+path,{method:'POST',body});}
+  catch(e){throw new Error('Geen verbinding met de feature service (netwerk of CORS): '+e.message);}
+  if(!res.ok)throw new Error('HTTP '+res.status+' van de feature service');
+  const j=await res.json();
+  if(j.error){
+    const msg=(j.error.message||'Onbekende fout')+(j.error.details&&j.error.details.length?' — '+j.error.details.join('; '):'');
+    if(j.error.code===498||j.error.code===499)throw new FsAuthError(msg);
+    throw new Error(msg+(j.error.code?' (code '+j.error.code+')':''));
+  }
+  return j;
+}
+async function fsQueryAll(where,outFields){
+  const out=[];let offset=0;
+  for(;;){
+    const j=await fsRequest('/query',{where,outFields:outFields||'*',returnGeometry:'false',orderByFields:fsOid,resultOffset:offset,resultRecordCount:fsPageSize});
+    const f=j.features||[];
+    for(const x of f)out.push(x);
+    if(!j.exceededTransferLimit||!f.length)break;
+    offset+=f.length;
+  }
+  return out;
+}
+async function fsApplyEdits(adds,updates,deletes){
+  const p={rollbackOnFailure:'true'};
+  if(adds.length)p.adds=JSON.stringify(adds);
+  if(updates.length)p.updates=JSON.stringify(updates);
+  if(deletes.length)p.deletes=deletes.join(',');
+  const j=await fsRequest('/applyEdits',p);
+  const bad=[].concat(j.addResults||[],j.updateResults||[],j.deleteResults||[]).filter(r=>r&&r.success===false);
+  if(bad.length){const e=bad[0].error||{};throw new Error('Schrijven naar de feature service mislukt: '+(e.description||e.message||'onbekende fout')+(bad.length>1?' (+'+(bad.length-1)+' meer)':''));}
+}
+
+// ── Kolommen koppelen ──
+function fsMapFields(meta){
+  const byNorm={};
+  (meta.fields||[]).forEach(f=>{byNorm[fsNorm(f.name)]=f;});
+  (meta.fields||[]).forEach(f=>{if(f.alias&&!byNorm[fsNorm(f.alias)])byNorm[fsNorm(f.alias)]=f;});
+  const map={},types={};
+  Object.keys(FS_FIELD_DEFS).forEach(k=>{for(const c of FS_FIELD_DEFS[k]){const f=byNorm[c];if(f){map[k]=f.name;types[f.name]=f.type;break;}}});
+  const oidF=(meta.fields||[]).find(f=>f.type==='esriFieldTypeOID');
+  return{map,types,oid:oidF?oidF.name:(meta.objectIdField||'OBJECTID'),
+    missing:FS_REQUIRED.filter(k=>!map[k]),
+    optionalMissing:Object.keys(FS_OPTIONAL_LABELS).filter(k=>!map[k])};
+}
+
+// ── Tabelrijen <-> metingen ──
+function fsDateIn(v,name){
+  if(v===null||v===undefined||v==='')return'';
+  if(fsTypes[name]==='esriFieldTypeDate'||typeof v==='number'){const d=new Date(Number(v));return isNaN(d)?'':d.toISOString().slice(0,10);}
+  return String(v).trim();
+}
+function fsDateOut(s,name){
+  if(fsTypes[name]==='esriFieldTypeDate'){const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(String(s||''));return m?Date.UTC(+m[1],+m[2]-1,+m[3]):null;}
+  return s?String(s):null;
+}
+function fsRowsForMeeting(m){
+  const F=fsF,me=m.meta,base={};
+  const put=(k,v)=>{if(F[k])base[F[k]]=v;};
+  put('id',me.id);put('project',me.project||null);put('locatie',me.locatie||null);put('datum',fsDateOut(me.datum,F.datum));
+  ['ws','sp','ld','ldTal','od','odTal','slootl','x0','y0','x1','y1'].forEach(k=>put(k,fsOutNum(me[k])));
+  const uit=me.soort==='uit';
+  put('soort',uit?'Uitpeiling':'Inpeiling');
+  put('linkMode',uit?(me.linkMode==='manual'?'Handmatig':'Automatisch'):null);
+  put('linkedId',me.linkedId||null);
+  put('bodemBron',me.bodemBron==='eigen'?'Eigen':'Inpeiling');
+  put('clip',me.clipBagVasteBodem?'Ja':'Nee');
+  put('watertype',me.watertype==='primair'?'Primair':me.watertype==='overig'?'Overig':null);
+  const pts=(m.pts||[]).filter(p=>!isNaN(p.af)).slice().sort((a,b)=>a.af-b.af);
+  const oever=(F.oever&&m.oeverPts&&m.oeverPts.length)?JSON.stringify(m.oeverPts):null;
+  return pts.map((p,i)=>{
+    const r=Object.assign({},base);
+    r[F.af]=p.af;r[F.bag]=fsOutNum(p.bag);r[F.bod]=fsOutNum(p.bod);
+    if(F.oever)r[F.oever]=i===0?oever:null;
+    return r;
+  });
+}
+const fsSignature=m=>fsHash(JSON.stringify(fsRowsForMeeting(m)));
+function fsBuildMeetings(features){
+  const F=fsF,groups=new Map();
+  for(const ft of features){
+    const a=ft.attributes||{};
+    const id=fsStr(a[F.id]);if(!id)continue;
+    let g=groups.get(id);
+    if(!g){
+      g={meta:{
+        id,project:fsStr(a[F.project]),locatie:fsStr(a[F.locatie]),datum:fsDateIn(a[F.datum],F.datum),
+        ws:fsNum(a[F.ws]),sp:fsNum(a[F.sp]),ld:fsNum(a[F.ld]),od:fsNum(a[F.od]),ldTal:fsNum(a[F.ldTal]),odTal:fsNum(a[F.odTal]),slootl:fsNum(a[F.slootl]),
+        x0:fsNum(a[F.x0]),y0:fsNum(a[F.y0]),x1:fsNum(a[F.x1]),y1:fsNum(a[F.y1]),
+        soort:fsStr(a[F.soort]).toLowerCase().startsWith('uit')?'uit':'in',
+        linkMode:/^(hand|manual)/i.test(fsStr(a[F.linkMode]))?'manual':'auto',
+        linkedId:fsStr(a[F.linkedId]),
+        bodemBron:fsStr(a[F.bodemBron]).toLowerCase().startsWith('eigen')?'eigen':'inpeiling',
+        clipBagVasteBodem:F.clip?/^(ja|true|1|waar)$/i.test(fsStr(a[F.clip])):false,
+        watertype:(w=>w.startsWith('primair')?'primair':w.startsWith('overig')?'overig':'')(fsStr(a[F.watertype]).toLowerCase()),
+      },pts:[],oeverPts:[],fsRemoteId:id};
+      groups.set(id,g);
+    }
+    const af=fsNum(a[F.af]),bag=fsNum(a[F.bag]),bod=fsNum(a[F.bod]);
+    if(!isNaN(af)&&(!isNaN(bag)||!isNaN(bod)))g.pts.push({af,bag,bod});
+    if(F.oever&&a[F.oever]&&!g.oeverPts.length){
+      try{const o=JSON.parse(a[F.oever]);if(Array.isArray(o))g.oeverPts=o.map(p=>Object.assign({},p,{af:p.af===null?NaN:p.af,cm:p.cm===null?NaN:p.cm}));}catch(e){}
+    }
+  }
+  const out=[];
+  groups.forEach(g=>{if(!g.pts.length)return;g.pts.sort((x,y)=>x.af-y.af);g.fsSig=fsSignature(g);out.push(g);});
+  return out;
+}
+
+// ── Verschil tussen lokale en bestaande rijen ──
+function fsSame(a,b){
+  for(const k of Object.keys(a)){
+    const x=a[k],y=b[k];if(x===undefined)continue;
+    const xn=(x===null||x===''),yn=(y===null||y===undefined||y==='');
+    if(xn||yn){if(xn&&yn)continue;return false;}
+    if(typeof x==='number'&&typeof y==='number'){if(Math.abs(x-y)>1e-6*Math.max(1,Math.abs(x)))return false;continue;}
+    if(String(x)!==String(y))return false;
+  }
+  return true;
+}
+function fsDiffRows(newRows,remote){
+  const af=fsF.af;
+  const rem=remote.slice().sort((x,y)=>(fsNum(x.attributes[af])-fsNum(y.attributes[af]))||(x.attributes[fsOid]-y.attributes[fsOid]));
+  const adds=[],updates=[],deletes=[];
+  const n=Math.max(newRows.length,rem.length);
+  for(let i=0;i<n;i++){
+    if(i<newRows.length&&i<rem.length){
+      if(!fsSame(newRows[i],rem[i].attributes)){const at=Object.assign({},newRows[i]);at[fsOid]=rem[i].attributes[fsOid];updates.push({attributes:at});}
+    }else if(i<newRows.length)adds.push({attributes:newRows[i]});
+    else deletes.push(rem[i].attributes[fsOid]);
+  }
+  return{adds,updates,deletes};
+}
+
+// ── Synchroniseren (lokale wijzigingen -> feature service) ──
+function fsScheduleSync(){
+  if(!fsConnected||!fsCanEdit||fsLoading)return;
+  fsDirty=true;
+  if(!fsCfg.autoSync)return;
+  clearTimeout(fsTimer);fsTimer=setTimeout(fsSyncNow,1500);
+}
+function fsQueueDelete(m){if(fsConnected&&m&&m.fsRemoteId)fsPendingDeletes.push(m.fsRemoteId);}
+function fsCarryRemote(oud,nieuw){if(oud&&nieuw){nieuw.fsRemoteId=oud.fsRemoteId;nieuw.fsSig=oud.fsSig;}}
+async function fsSyncNow(){
+  if(!fsConnected||!fsCanEdit||fsLoading)return;
+  if(fsBusy){fsRerun=true;return;}
+  fsBusy=true;fsRerun=false;clearTimeout(fsTimer);
+  const errors=[];let n=0;
+  try{
+    fsSetStatus('Synchroniseren…','busy');
+    // 1) verwijderde metingen
+    if(fsPendingDeletes.length){
+      const ids=[...new Set(fsPendingDeletes)];
+      const oids=[];
+      for(const ch of fsChunk(ids,40)){(await fsQueryAll(fsInList(ch),fsOid)).forEach(ft=>oids.push(ft.attributes[fsOid]));}
+      for(const ch of fsChunk(oids,500))await fsApplyEdits([],[],ch);
+      fsPendingDeletes=fsPendingDeletes.filter(x=>!ids.includes(x));
+      n+=ids.length;
+    }
+    // 2) gewijzigde/nieuwe metingen
+    const dirty=[];
+    for(const m of meetings){
+      if(!(m.pts&&m.pts.length)&&!m.fsRemoteId)continue;
+      const rows=fsRowsForMeeting(m),sig=fsHash(JSON.stringify(rows));
+      if(m.fsSig===sig||m.fsConflict===sig)continue;
+      dirty.push({m,rows,sig});
+    }
+    const hasRename=dirty.some(d=>d.m.fsRemoteId&&d.m.fsRemoteId!==d.m.meta.id);
+    const batches=hasRename?[dirty]:fsChunk(dirty,25);
+    for(const batch of batches){
+      if(!batch.length)continue;
+      const remoteRows=new Map();
+      const remoteIds=[...new Set(batch.filter(d=>d.m.fsRemoteId).map(d=>d.m.fsRemoteId))];
+      for(const ch of fsChunk(remoteIds,40)){
+        (await fsQueryAll(fsInList(ch))).forEach(ft=>{const k=fsStr(ft.attributes[fsF.id]);if(!remoteRows.has(k))remoteRows.set(k,[]);remoteRows.get(k).push(ft);});
+      }
+      const targets=[...new Set(batch.filter(d=>d.m.fsRemoteId!==d.m.meta.id).map(d=>d.m.meta.id))];
+      const existing=new Set();
+      for(const ch of fsChunk(targets,40)){(await fsQueryAll(fsInList(ch),fsF.id)).forEach(ft=>existing.add(fsStr(ft.attributes[fsF.id])));}
+      const leaving=new Set(batch.filter(d=>d.m.fsRemoteId&&d.m.fsRemoteId!==d.m.meta.id).map(d=>d.m.fsRemoteId));
+      const adds=[],updates=[],deletes=[],ok=[];
+      for(const d of batch){
+        const tgt=d.m.meta.id;
+        if(d.m.fsRemoteId!==tgt&&existing.has(tgt)&&!leaving.has(tgt)){d.m.fsConflict=d.sig;errors.push('ID "'+tgt+'" bestaat al in de feature service');continue;}
+        const diff=fsDiffRows(d.rows,d.m.fsRemoteId?(remoteRows.get(d.m.fsRemoteId)||[]):[]);
+        adds.push(...diff.adds);updates.push(...diff.updates);deletes.push(...diff.deletes);ok.push(d);
+      }
+      if(adds.length||updates.length||deletes.length)await fsApplyEdits(adds,updates,deletes);
+      ok.forEach(d=>{d.m.fsRemoteId=d.m.meta.id;d.m.fsSig=d.sig;delete d.m.fsConflict;n++;});
+    }
+    fsLastSync=new Date();fsDirty=false;
+    if(errors.length)fsSetStatus('Niet alles gesynchroniseerd: '+errors.join('; '),'err');
+    else fsSetStatus('Gesynchroniseerd '+fsLastSync.toLocaleTimeString('nl-NL',{hour:'2-digit',minute:'2-digit'})+(n?' ('+n+' meting(en) bijgewerkt)':''),'ok');
+  }catch(e){
+    console.error('Synchronisatie mislukt:',e);
+    fsSetStatus(e instanceof FsAuthError?'Aanmelden vereist — open "Feature service" en klik Verbinden & laden':'Synchronisatie mislukt: '+e.message,'err');
+  }finally{
+    fsBusy=false;
+    if(fsRerun)fsScheduleSync();
+  }
+}
+
+// ── Verbinden en laden (feature service -> tool) ──
+function fsReplaceMeetings(arr){
+  meetings=arr;selectedIds.clear();
+  if(typeof batchSelectedIds!=='undefined')batchSelectedIds.clear();
+  if(typeof trajectSelectedIds!=='undefined')trajectSelectedIds=new Set();
+  activeKeys={};activeCompareKeys={};
+  closeDetail();closeEdit();
+}
+function fsHasUnsynced(){return meetings.some(m=>((m.pts&&m.pts.length)||m.fsRemoteId)&&m.fsSig!==fsSignature(m))||fsPendingDeletes.length>0;}
+async function fsConnect(opts){
+  opts=opts||{};
+  fsCfg.url=String(fsCfg.url||'').trim();
+  if(!/\/FeatureServer\/\d+\/?$/i.test(fsCfg.url))throw new Error('De URL moet eindigen op /FeatureServer/<nummer> (de tabel zelf, niet alleen de service).');
+  fsSetStatus('Verbinden…','busy');
+  fsConnected=false;
+  let meta;
+  try{meta=await fsRequest('',{});}
+  catch(e){
+    if(e instanceof FsAuthError){
+      if(!opts.interactive)throw e;
+      await fsLogin();
+      meta=await fsRequest('',{});
+    }else throw e;
+  }
+  const mp=fsMapFields(meta);
+  if(mp.missing.length)throw new Error('Deze kolommen ontbreken in de tabel: '+mp.missing.map(k=>FS_FIELD_DEFS[k][0]).join(', ')+'. Verwacht worden de kolommen van de CSV-template (MeetingID, Afstand_m, BovenkantBagger_cm, VasteBodem_cm, …).');
+  fsF=mp.map;fsTypes=mp.types;fsOid=mp.oid;fsMissingOptional=mp.optionalMissing;
+  const cap=String(meta.capabilities||'');
+  const lack=['Create','Update','Delete'].filter(c=>!new RegExp(c,'i').test(cap));
+  fsCanEdit=!lack.length;
+  fsPageSize=Math.min(meta.maxRecordCount||1000,2000);
+  const feats=await fsQueryAll('1=1');
+  const remote=fsBuildMeetings(feats);
+  let keepLocal=false;
+  if(meetings.length){
+    if(!remote.length){
+      if(!fsCanEdit)throw new Error('De tabel is leeg en niet bewerkbaar — er is niets om te laden.');
+      if(!confirm('De tabel in de feature service is leeg. De '+meetings.length+' meting(en) die nu in de tool staan uploaden?'))throw new Error('Verbinden geannuleerd.');
+      meetings.forEach(m=>{delete m.fsRemoteId;delete m.fsSig;delete m.fsConflict;});
+      keepLocal=true;
+    }else if(fsHasUnsynced()&&!confirm('Er staan lokale wijzigingen in de tool die nog niet in de feature service staan. Doorgaan vervangt de metingen in de tool door de data uit de feature service (lokale wijzigingen gaan verloren). Doorgaan?')){
+      throw new Error('Verbinden geannuleerd.');
+    }
+  }
+  fsLoading=true;
+  try{if(!keepLocal){fsPendingDeletes=[];fsReplaceMeetings(remote);}}finally{fsLoading=false;}
+  fsConnected=true;
+  fsLastSync=new Date();fsDirty=false;
+  renderAll();
+  let msg=keepLocal?'Verbonden — lokale metingen worden geüpload.':'Verbonden: '+remote.length+' meting(en) geladen uit de feature service.';
+  if(!fsCanEdit)msg+=' LET OP: alleen lezen (ontbrekende rechten op de laag: '+lack.join(', ')+').';
+  if(fsMissingOptional.length)msg+=' Niet opgeslagen omdat de kolom ontbreekt: '+fsMissingOptional.map(k=>FS_OPTIONAL_LABELS[k]).join(', ')+'.';
+  fsSetStatus(fsCanEdit?'Verbonden · '+remote.length+' meting(en)':'Verbonden (alleen lezen)',fsCanEdit?'ok':'err');
+  if(keepLocal)fsScheduleSync();
+  return msg;
+}
+async function fsReload(){
+  if(!fsConnected)throw new Error('Niet verbonden.');
+  if(fsHasUnsynced()&&!confirm('Er zijn nog niet-gesynchroniseerde wijzigingen. Opnieuw laden vervangt alles door de data uit de feature service. Doorgaan?'))return null;
+  fsSetStatus('Laden…','busy');
+  const remote=fsBuildMeetings(await fsQueryAll('1=1'));
+  fsLoading=true;
+  try{fsPendingDeletes=[];fsReplaceMeetings(remote);}finally{fsLoading=false;}
+  fsDirty=false;renderAll();
+  fsSetStatus('Verbonden · '+remote.length+' meting(en) opnieuw geladen','ok');
+  return remote.length;
+}
+function fsDisconnect(){
+  fsConnected=false;clearTimeout(fsTimer);fsCfg.token='';fsCfg.tokenExp=0;fsSaveToken();
+  fsSetStatus('Niet verbonden','');
+}
+
+// ── Gebruikersinterface ──
+function fsSetStatus(txt,kind){
+  const el=document.getElementById('fs-indicator');if(!el)return;
+  el.textContent='Feature service: '+txt;
+  el.style.color=kind==='err'?'var(--danger)':kind==='ok'?'var(--success)':'var(--text-m)';
+}
+function fsDialogMsg(txt,kind){
+  const el=document.getElementById('fs-dialog-msg');if(!el)return;
+  el.textContent=txt||'';
+  el.style.color=kind==='err'?'var(--danger)':kind==='ok'?'var(--success)':'var(--text-m)';
+}
+function fsOpenDialog(){
+  document.getElementById('fs-url').value=fsCfg.url;
+  document.getElementById('fs-client').value=fsCfg.clientId;
+  document.getElementById('fs-portal').value=fsCfg.portal;
+  document.getElementById('fs-token').value='';
+  document.getElementById('fs-auto').checked=!!fsCfg.autoSync;
+  document.getElementById('fs-redirect').textContent=location.origin+location.pathname;
+  fsDialogMsg(fsConnected?'Verbonden.':'Nog niet verbonden.','');
+  document.getElementById('fs-overlay').style.display='block';
+}
+function fsCloseDialog(){document.getElementById('fs-overlay').style.display='none';}
+function fsReadDialog(){
+  fsCfg.url=document.getElementById('fs-url').value.trim();
+  fsCfg.clientId=document.getElementById('fs-client').value.trim();
+  fsCfg.portal=document.getElementById('fs-portal').value.trim()||FS_DEFAULT_PORTAL;
+  fsCfg.autoSync=document.getElementById('fs-auto').checked;
+  const t=document.getElementById('fs-token').value.trim();
+  if(t){fsCfg.token=t;fsCfg.tokenExp=0;fsSaveToken();}
+  fsSaveCfg();
+}
+async function fsDialogConnect(){
+  fsReadDialog();fsDialogMsg('Verbinden…','');
+  try{const msg=await fsConnect({interactive:true});fsDialogMsg(msg,'ok');}
+  catch(e){fsDialogMsg(e.message,'err');fsSetStatus(e.message,'err');}
+}
+async function fsDialogSyncNow(){
+  fsReadDialog();
+  if(!fsConnected){fsDialogMsg('Eerst verbinden.','err');return;}
+  if(!fsCanEdit){fsDialogMsg('De laag is niet bewerkbaar (alleen lezen).','err');return;}
+  await fsSyncNow();fsDialogMsg(document.getElementById('fs-indicator').textContent,'');
+}
+async function fsDialogReload(){
+  fsReadDialog();
+  try{const n=await fsReload();if(n!==null)fsDialogMsg(n+' meting(en) opnieuw geladen.','ok');}
+  catch(e){fsDialogMsg(e.message,'err');}
+}
+function fsDialogDisconnect(){fsDisconnect();fsDialogMsg('Verbinding verbroken. Lokale metingen blijven in de tool staan, maar worden niet meer teruggeschreven.','');}
+window.addEventListener('beforeunload',e=>{if(fsConnected&&fsCanEdit&&(fsBusy||fsDirty&&fsHasUnsyncedSafe())){e.preventDefault();e.returnValue='';}});
+function fsHasUnsyncedSafe(){try{return fsHasUnsynced();}catch(e){return false;}}
+async function fsInit(){
+  fsLoadCfg();
+  fsSetStatus('Niet verbonden','');
+  if(fsCfg.url){
+    try{
+      await fsConnect({interactive:false});
+    }catch(e){
+      fsSetStatus(e instanceof FsAuthError?'Aanmelden vereist — klik "Feature service" en dan Verbinden & laden':e.message,'err');
+    }
+  }
+}
+
+if(!window.__fsOauthPopup){
+  renderAll();
+  probeerAutosaveTeHerstellen().then(fsInit);
+}
 </script>
 </body>
 </html>
