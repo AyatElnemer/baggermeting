@@ -837,6 +837,7 @@ input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var
       <div><label>URL van de tabel (eindigt op /FeatureServer/&lt;nummer&gt;)</label><input id="fs-url" type="text" placeholder="https://services.arcgis.com/…/arcgis/rest/services/…/FeatureServer/0"></div>
       <div><label>Client ID van je ArcGIS-app (voor aanmelden; leeg laten bij een openbare service)</label><input id="fs-client" type="text" placeholder="bijv. aBcD1234eFgH5678"></div>
       <div><label>Portal-URL</label><input id="fs-portal" type="text" placeholder="https://www.arcgis.com"></div>
+      <div><label>Profiel-ID-veld (alleen voor PS_Dwarsprofiel-tabellen: welk veld hoort bij één dwarsprofiel)</label><select id="fs-key"><option value="">Automatisch bepalen</option></select></div>
       <div><label>Token (optioneel, alternatief voor aanmelden)</label><input id="fs-token" type="password" autocomplete="off" placeholder="plak hier eventueel een token"></div>
       <div style="font-size:12px;color:var(--text-m)">Redirect-URI om te registreren bij je ArcGIS-app: <code id="fs-redirect" style="user-select:all"></code></div>
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="fs-auto" checked>Wijzigingen automatisch terugschrijven (na ± 1,5 s)</label>
@@ -8463,10 +8464,11 @@ function exportVolumesExcel(){
 // Werkt zonder extra bibliotheken: alleen fetch + de ArcGIS REST-endpoints query/applyEdits.
 // ════════════════════════════════════════
 const FS_CFG_KEY='baggermeting_fs_cfg',FS_TOKEN_KEY='baggermeting_fs_token',FS_DEFAULT_PORTAL='https://www.arcgis.com';
-let fsCfg={url:'',portal:FS_DEFAULT_PORTAL,clientId:'',token:'',tokenExp:0,autoSync:true};
+let fsCfg={url:'',portal:FS_DEFAULT_PORTAL,clientId:'',token:'',tokenExp:0,autoSync:true,keyField:''};
 let fsF={},fsTypes={},fsOid='OBJECTID',fsCanEdit=false,fsPageSize=1000,fsMissingOptional=[];
 let fsConnected=false,fsLoading=false,fsBusy=false,fsRerun=false,fsTimer=null,fsDirty=false,fsLastSync=null;
 let fsPendingDeletes=[];
+let fsSchema='template',fsKeyField='',fsKeyNumeric=false,fsPsCols={},fsCopyExclude=new Set(),fsPsMeta={};
 class FsAuthError extends Error{}
 
 // Kolomnamen worden hoofdletter- en leesteken-onafhankelijk herkend (zelfde aliassen als de CSV-import).
@@ -8483,7 +8485,17 @@ const FS_FIELD_DEFS={
   oever:['oeverptsjson','oeverjson']
 };
 const FS_REQUIRED=['id','af','bag','bod'];
-const FS_OPTIONAL_LABELS={clip:'ClipBagVasteBodem',watertype:'Watertype',oever:'OeverPts_JSON'};
+const FS_OPTIONAL_LABELS={clip:'ClipBagVasteBodem',watertype:'Watertype',oever:'OeverPts_JSON',uit:'Bagger_diepte_uitpeilen_cm'};
+// Tweede tabelvorm: PS_Dwarsprofiel (MudManager). Eén rij per meetpunt, waarin inpeiling (BAG_DIEP, VASTE_BODEM) en
+// uitpeiling (Bagger_diepte_uitpeilen_cm) op dezelfde AFSTAND staan. Per profiel worden twee metingen gemaakt.
+const FS_PS_DEFS={
+  af:['afstand','afstandm'],bag:['bagdiep','baggerdiepteinpeilingcm'],bod:['vastebodem','vastebodemcm'],
+  uit:['baggerdiepteuitpeilencm','baggerdiepteuitpeilingcm'],
+  datIn:['datumpsmeting','datummetinginpeiling','datuminpeiling'],datUit:['datumclmeting','datummetinguitpeiling','datumuitpeiling'],
+  locatie:['leggercode','ingreepcode','locatie'],traject:['trajectnaam'],project:['projectnr','projectnummer','projectnaam']
+};
+const FS_PS_META_KEYS=['ws','sp','ld','ldTal','od','odTal','slootl','x0','y0','x1','y1'];
+const FS_PS_KEY_CANDIDATES=['Code','GLID','Leggercode'];
 const fsNorm=s=>String(s==null?'':s).toLowerCase().replace(/[^a-z0-9]/g,'');
 const fsNum=v=>(v===null||v===undefined||v==='')?NaN:Number(v);
 const fsOutNum=v=>(typeof v==='number'&&isFinite(v))?v:null;
@@ -8495,7 +8507,7 @@ function fsInList(ids){return fsF.id+' IN ('+ids.map(i=>"'"+fsEsc(i)+"'").join('
 
 // ── Instellingen (URL-parameters ?service=…&clientId=…&portal=… hebben voorrang) ──
 function fsLoadCfg(){
-  try{const s=JSON.parse(localStorage.getItem(FS_CFG_KEY)||'{}');fsCfg.url=s.url||'';fsCfg.portal=s.portal||FS_DEFAULT_PORTAL;fsCfg.clientId=s.clientId||'';fsCfg.autoSync=s.autoSync!==false;}catch(e){}
+  try{const s=JSON.parse(localStorage.getItem(FS_CFG_KEY)||'{}');fsCfg.url=s.url||'';fsCfg.portal=s.portal||FS_DEFAULT_PORTAL;fsCfg.clientId=s.clientId||'';fsCfg.autoSync=s.autoSync!==false;fsCfg.keyField=s.keyField||'';}catch(e){}
   try{const t=JSON.parse(sessionStorage.getItem(FS_TOKEN_KEY)||'null');if(t&&t.token&&(!t.exp||t.exp>Date.now())){fsCfg.token=t.token;fsCfg.tokenExp=t.exp||0;}}catch(e){}
   try{
     const q=new URLSearchParams(location.search);
@@ -8503,9 +8515,10 @@ function fsLoadCfg(){
     if(q.get('portal'))fsCfg.portal=q.get('portal');
     if(q.get('clientId'))fsCfg.clientId=q.get('clientId');
     if(q.get('autosync')==='0')fsCfg.autoSync=false;
+    if(q.get('profileField'))fsCfg.keyField=q.get('profileField');
   }catch(e){}
 }
-function fsSaveCfg(){try{localStorage.setItem(FS_CFG_KEY,JSON.stringify({url:fsCfg.url,portal:fsCfg.portal,clientId:fsCfg.clientId,autoSync:fsCfg.autoSync}));}catch(e){}}
+function fsSaveCfg(){try{localStorage.setItem(FS_CFG_KEY,JSON.stringify({url:fsCfg.url,portal:fsCfg.portal,clientId:fsCfg.clientId,autoSync:fsCfg.autoSync,keyField:fsCfg.keyField}));}catch(e){}}
 function fsSaveToken(){try{sessionStorage.setItem(FS_TOKEN_KEY,JSON.stringify({token:fsCfg.token,exp:fsCfg.tokenExp}));}catch(e){}}
 
 // ── Aanmelden (OAuth 2.0, popup) ──
@@ -8645,16 +8658,18 @@ function fsBuildMeetings(features){
 }
 
 // ── Verschil tussen lokale en bestaande rijen ──
-function fsSame(a,b){
+function fsChangedAttrs(a,b){
+  const out={};
   for(const k of Object.keys(a)){
     const x=a[k],y=b[k];if(x===undefined)continue;
     const xn=(x===null||x===''),yn=(y===null||y===undefined||y==='');
-    if(xn||yn){if(xn&&yn)continue;return false;}
-    if(typeof x==='number'&&typeof y==='number'){if(Math.abs(x-y)>1e-6*Math.max(1,Math.abs(x)))return false;continue;}
-    if(String(x)!==String(y))return false;
+    if(xn||yn){if(!(xn&&yn))out[k]=x;continue;}
+    if(typeof x==='number'&&typeof y==='number'){if(Math.abs(x-y)>1e-6*Math.max(1,Math.abs(x)))out[k]=x;continue;}
+    if(String(x)!==String(y))out[k]=x;
   }
-  return true;
+  return out;
 }
+const fsSame=(a,b)=>!Object.keys(fsChangedAttrs(a,b)).length;
 function fsDiffRows(newRows,remote){
   const af=fsF.af;
   const rem=remote.slice().sort((x,y)=>(fsNum(x.attributes[af])-fsNum(y.attributes[af]))||(x.attributes[fsOid]-y.attributes[fsOid]));
@@ -8669,6 +8684,204 @@ function fsDiffRows(newRows,remote){
   return{adds,updates,deletes};
 }
 
+// ── PS_Dwarsprofiel-schema: lezen ──
+const fsAfKey=v=>(Math.round(v*10000)/10000).toFixed(4);
+const fsLit=v=>fsKeyNumeric?String(Number(v)):"'"+fsEsc(v)+"'";
+const fsKeyWhere=keys=>fsKeyField+' IN ('+keys.map(fsLit).join(',')+')';
+function fsMapFieldsPS(meta){
+  const byNorm={};
+  (meta.fields||[]).forEach(f=>{byNorm[fsNorm(f.name)]=f;});
+  (meta.fields||[]).forEach(f=>{if(f.alias&&!byNorm[fsNorm(f.alias)])byNorm[fsNorm(f.alias)]=f;});
+  const map={},types={},metaCols={};
+  Object.keys(FS_PS_DEFS).forEach(k=>{for(const c of FS_PS_DEFS[k]){const f=byNorm[c];if(f){map[k]=f.name;types[f.name]=f.type;break;}}});
+  FS_PS_META_KEYS.forEach(k=>{for(const c of FS_FIELD_DEFS[k]){const f=byNorm[c];if(f){metaCols[k]=f.name;types[f.name]=f.type;break;}}});
+  const oidF=(meta.fields||[]).find(f=>f.type==='esriFieldTypeOID');
+  return{map,types,metaCols,oid:oidF?oidF.name:(meta.objectIdField||'OBJECTID'),
+    missing:['af','bag','bod'].filter(k=>!map[k]),optionalMissing:map.uit?[]:['uit']};
+}
+function fsKeyFieldList(meta){
+  return(meta.fields||[]).filter(f=>/^esriField(Type(String|GUID|Integer|SmallInteger|GlobalID))$/.test(f.type)).map(f=>f.name);
+}
+let fsKeyFieldChoices=[];
+function fsFillKeySelect(meta){
+  if(meta)fsKeyFieldChoices=fsKeyFieldList(meta);
+  const el=document.getElementById('fs-key');if(!el||!el.appendChild)return;
+  const list=fsKeyFieldChoices.slice();if(fsCfg.keyField&&!list.includes(fsCfg.keyField))list.push(fsCfg.keyField);
+  el.innerHTML='<option value="">Automatisch bepalen</option>'+list.map(n=>'<option value="'+n+'">'+n+'</option>').join('');
+  el.value=fsCfg.keyField||'';
+}
+function fsResolveKey(meta,feats){
+  const fields=(meta.fields||[]).filter(f=>fsKeyFieldList(meta).includes(f.name));
+  const byName=n=>fields.find(f=>fsNorm(f.name)===fsNorm(n));
+  const evalKey=name=>{
+    const g=new Map();
+    feats.forEach(ft=>{const a=ft.attributes||{};const k=fsStr(a[name]);if(!k)return;if(!g.has(k))g.set(k,[]);g.get(k).push(fsNum(a[fsPsCols.af]));});
+    if(!g.size)return null;
+    let rows=0,bad=0;
+    g.forEach(arr=>{rows+=arr.length;if(new Set(arr.map(v=>Math.round(v*1e4))).size<arr.length)bad++;});
+    return{groups:g.size,avg:rows/g.size,badFrac:bad/g.size};
+  };
+  let f=null;
+  if(fsCfg.keyField){
+    f=byName(fsCfg.keyField);
+    if(!f)throw new Error('Het gekozen profiel-ID-veld "'+fsCfg.keyField+'" bestaat niet in deze tabel.');
+  }else if(!feats.length){
+    f=FS_PS_KEY_CANDIDATES.map(byName).find(Boolean)||null;
+  }else{
+    for(const c of FS_PS_KEY_CANDIDATES){
+      const cf=byName(c);if(!cf)continue;
+      const st=evalKey(cf.name);
+      if(st&&st.avg>=2&&st.badFrac<=0.1){f=cf;break;}
+    }
+  }
+  if(!f)throw new Error('Kon niet automatisch bepalen welk veld de rijen van één dwarsprofiel bij elkaar houdt. Kies het veld bij "Profiel-ID-veld" (bijvoorbeeld Code of GLID) en klik opnieuw op Verbinden & laden.');
+  fsKeyField=f.name;
+  fsKeyNumeric=/Integer|SmallInteger|Double|Single/.test(f.type);
+  const ex=new Set(['CreationDate','Creator','EditDate','Editor']);
+  (meta.fields||[]).forEach(x=>{if(x.type==='esriFieldTypeOID'||x.type==='esriFieldTypeGlobalID'||(x.type==='esriFieldTypeGUID'&&x.name!==fsKeyField)||/^shape/i.test(x.name))ex.add(x.name);});
+  const efi=meta.editFieldsInfo||{};[efi.creationDateField,efi.creatorField,efi.editDateField,efi.editorField].forEach(n=>{if(n)ex.add(n);});
+  ['af','bag','bod','uit'].forEach(k=>{if(fsPsCols[k])ex.add(fsPsCols[k]);});
+  ex.delete(fsKeyField);
+  fsCopyExclude=ex;
+}
+function fsPsMetaFromRow(a,id,soort,datum){
+  const C=fsPsCols,M=fsPsMeta,pick=k=>M[k]?fsNum(a[M[k]]):NaN;
+  return{id,project:fsStr(a[C.project])||fsStr(a[C.traject]),locatie:fsStr(a[C.locatie])||fsStr(a[C.traject]),datum,
+    ws:pick('ws'),sp:pick('sp'),ld:pick('ld'),od:pick('od'),ldTal:pick('ldTal'),odTal:pick('odTal'),slootl:pick('slootl'),
+    x0:pick('x0'),y0:pick('y0'),x1:pick('x1'),y1:pick('y1'),
+    soort,linkMode:'auto',linkedId:'',bodemBron:'inpeiling',clipBagVasteBodem:false,watertype:''};
+}
+function fsBuildMeetingsPS(features){
+  const C=fsPsCols,groups=new Map();
+  for(const ft of features){
+    const a=ft.attributes||{};const k=fsStr(a[fsKeyField]);if(!k)continue;
+    if(!groups.has(k))groups.set(k,[]);groups.get(k).push(a);
+  }
+  const used=new Set(),seq=new Map(),out=[];
+  groups.forEach((rows,key)=>{
+    const first=rows[0];
+    const guid=/^\{?[0-9a-f]{8}-[0-9a-f]{4}-/i.test(key);
+    let id;
+    if(guid){
+      const loc=fsStr(first[C.locatie])||fsStr(first[C.traject])||'profiel';
+      let n=(seq.get(loc)||0)+1;seq.set(loc,n);
+      id=loc+'-'+String(n).padStart(2,'0');
+    }else id=key;
+    while(used.has(id))id+='_';
+    used.add(id);
+    const datIn=fsDateIn(rows.map(r=>r[C.datIn]).find(v=>v!==null&&v!==undefined&&v!=='')||null,C.datIn);
+    const datUit=fsDateIn(rows.map(r=>r[C.datUit]).find(v=>v!==null&&v!==undefined&&v!=='')||null,C.datUit);
+    const inPts=[],uitPts=[];
+    rows.forEach(a=>{
+      const af=fsNum(a[C.af]);if(isNaN(af))return;
+      const bag=fsNum(a[C.bag]),bod=fsNum(a[C.bod]);
+      if(!isNaN(bag)||!isNaN(bod))inPts.push({af,bag,bod});
+      const u=C.uit?fsNum(a[C.uit]):NaN;
+      if(!isNaN(u))uitPts.push({af,bag:u,bod:NaN});
+    });
+    inPts.sort((x,y)=>x.af-y.af);uitPts.sort((x,y)=>x.af-y.af);
+    const mIn={meta:fsPsMetaFromRow(first,id,'in',datIn||datUit),pts:inPts,oeverPts:[],fsKey:key};
+    const group={in:mIn,uit:null};
+    out.push(mIn);
+    if(uitPts.length){
+      const uid=id+'-UIT';
+      const meta=fsPsMetaFromRow(first,uid,'uit',datUit||datIn);
+      meta.linkMode='manual';meta.linkedId=id;meta.bodemBron='inpeiling';
+      const mUit={meta,pts:uitPts,oeverPts:[],fsKey:key};
+      group.uit=mUit;out.push(mUit);
+    }
+    if(inPts.length||uitPts.length){
+      const sig=fsHash(JSON.stringify(fsPsDesired(group)));
+      mIn.fsSig=sig;if(group.uit)group.uit.fsSig=sig;
+    }
+  });
+  return out.filter(m=>m.pts.length);
+}
+const fsBuildAny=feats=>fsSchema==='ps'?fsBuildMeetingsPS(feats):fsBuildMeetings(feats);
+
+// ── PS_Dwarsprofiel-schema: schrijven ──
+function fsPsGroups(){
+  const g=new Map();
+  meetings.forEach(m=>{
+    if(!m.fsKey)return;
+    const o=g.get(m.fsKey)||{in:null,uit:null};
+    if(m.meta.soort==='uit')o.uit=m;else o.in=m;
+    g.set(m.fsKey,o);
+  });
+  return g;
+}
+function fsPsDesired(group){
+  const rows=new Map();
+  const touch=af=>{const k=fsAfKey(af);if(!rows.has(k))rows.set(k,{af,bag:null,bod:null,uit:null});return rows.get(k);};
+  if(group.in)group.in.pts.forEach(p=>{if(isNaN(p.af))return;const r=touch(p.af);r.bag=fsOutNum(p.bag);r.bod=fsOutNum(p.bod);});
+  if(group.uit)group.uit.pts.forEach(p=>{if(isNaN(p.af))return;touch(p.af).uit=fsOutNum(p.bag);});
+  const base=(group.in||group.uit).meta;
+  const prof={locatie:base.locatie||null,project:base.project||null};
+  FS_PS_META_KEYS.forEach(k=>{if(fsPsMeta[k])prof[k]=fsOutNum(base[k]);});
+  prof.datIn=group.in?(group.in.meta.datum||null):undefined;
+  prof.datUit=group.uit?(group.uit.meta.datum||null):undefined;
+  return{rows:[...rows.values()].sort((a,b)=>a.af-b.af),prof};
+}
+function fsPsProfAttrs(prof){
+  const C=fsPsCols,at={};
+  if(C.locatie)at[C.locatie]=prof.locatie;
+  if(C.project)at[C.project]=prof.project;
+  FS_PS_META_KEYS.forEach(k=>{if(fsPsMeta[k]&&prof[k]!==undefined)at[fsPsMeta[k]]=prof[k];});
+  if(C.datIn&&prof.datIn!==undefined)at[C.datIn]=fsDateOut(prof.datIn,C.datIn);
+  if(C.datUit&&prof.datUit!==undefined)at[C.datUit]=fsDateOut(prof.datUit,C.datUit);
+  return at;
+}
+function fsPsDiff(d,key,rem){
+  const C=fsPsCols,remBy=new Map();
+  rem.forEach(ft=>{const k=fsAfKey(fsNum(ft.attributes[C.af]));if(!remBy.has(k))remBy.set(k,[]);remBy.get(k).push(ft);});
+  const tpl=rem.length?rem[0].attributes:null,base={};
+  if(tpl)Object.keys(tpl).forEach(f=>{if(!fsCopyExclude.has(f))base[f]=tpl[f];});
+  base[fsKeyField]=tpl?tpl[fsKeyField]:key;
+  const prof=fsPsProfAttrs(d.prof),adds=[],updates=[],deletes=[];
+  d.rows.forEach(r=>{
+    const vals={};vals[C.af]=r.af;vals[C.bag]=r.bag;vals[C.bod]=r.bod;if(C.uit)vals[C.uit]=r.uit;
+    const arr=remBy.get(fsAfKey(r.af));
+    if(arr&&arr.length){
+      const ft=arr.shift();
+      const want=Object.assign({},prof,vals);delete want[C.af];
+      const ch=fsChangedAttrs(want,ft.attributes);
+      if(Object.keys(ch).length){ch[fsOid]=ft.attributes[fsOid];updates.push({attributes:ch});}
+    }else adds.push({attributes:Object.assign({},base,prof,vals)});
+  });
+  remBy.forEach(arr=>arr.forEach(ft=>deletes.push(ft.attributes[fsOid])));
+  return{adds,updates,deletes};
+}
+async function fsSyncPS(errors){
+  let n=0;
+  if(fsPendingDeletes.length){
+    const keys=[...new Set(fsPendingDeletes)],oids=[];
+    for(const ch of fsChunk(keys,40))(await fsQueryAll(fsKeyWhere(ch),fsOid)).forEach(ft=>oids.push(ft.attributes[fsOid]));
+    for(const ch of fsChunk(oids,500))await fsApplyEdits([],[],ch);
+    fsPendingDeletes=fsPendingDeletes.filter(x=>!keys.includes(x));
+    n+=keys.length;
+  }
+  const dirty=[];
+  fsPsGroups().forEach((g,key)=>{
+    const ms=[g.in,g.uit].filter(Boolean);if(!ms.length)return;
+    const d=fsPsDesired(g),sig=fsHash(JSON.stringify(d));
+    if(ms.every(m=>m.fsSig===sig))return;
+    dirty.push({key,d,sig,ms});
+  });
+  for(const batch of fsChunk(dirty,25)){
+    const remote=new Map();
+    for(const ch of fsChunk(batch.map(x=>x.key),40)){
+      (await fsQueryAll(fsKeyWhere(ch))).forEach(ft=>{const k=fsStr(ft.attributes[fsKeyField]);if(!remote.has(k))remote.set(k,[]);remote.get(k).push(ft);});
+    }
+    const adds=[],updates=[],deletes=[];
+    batch.forEach(x=>{const df=fsPsDiff(x.d,x.key,remote.get(x.key)||[]);adds.push(...df.adds);updates.push(...df.updates);deletes.push(...df.deletes);});
+    if(adds.length||updates.length||deletes.length)await fsApplyEdits(adds,updates,deletes);
+    batch.forEach(x=>{x.ms.forEach(m=>{m.fsSig=x.sig;});n++;});
+  }
+  const lokaal=meetings.filter(m=>!m.fsKey&&m.pts&&m.pts.length).length;
+  if(lokaal)errors.push(lokaal+' lokale meting(en) zonder profiel in de tabel worden niet geschreven');
+  return n;
+}
+
 // ── Synchroniseren (lokale wijzigingen -> feature service) ──
 function fsScheduleSync(){
   if(!fsConnected||!fsCanEdit||fsLoading)return;
@@ -8676,7 +8889,11 @@ function fsScheduleSync(){
   if(!fsCfg.autoSync)return;
   clearTimeout(fsTimer);fsTimer=setTimeout(fsSyncNow,1500);
 }
-function fsQueueDelete(m){if(fsConnected&&m&&m.fsRemoteId)fsPendingDeletes.push(m.fsRemoteId);}
+function fsQueueDelete(m){
+  if(!fsConnected||!m)return;
+  if(fsSchema==='ps'){if(m.fsKey&&!meetings.some(x=>x!==m&&x.fsKey===m.fsKey))fsPendingDeletes.push(m.fsKey);return;}
+  if(m.fsRemoteId)fsPendingDeletes.push(m.fsRemoteId);
+}
 function fsCarryRemote(oud,nieuw){if(oud&&nieuw){nieuw.fsRemoteId=oud.fsRemoteId;nieuw.fsSig=oud.fsSig;}}
 async function fsSyncNow(){
   if(!fsConnected||!fsCanEdit||fsLoading)return;
@@ -8685,6 +8902,7 @@ async function fsSyncNow(){
   const errors=[];let n=0;
   try{
     fsSetStatus('Synchroniseren…','busy');
+    if(fsSchema==='ps'){n=await fsSyncPS(errors);}else{
     // 1) verwijderde metingen
     if(fsPendingDeletes.length){
       const ids=[...new Set(fsPendingDeletes)];
@@ -8725,6 +8943,7 @@ async function fsSyncNow(){
       if(adds.length||updates.length||deletes.length)await fsApplyEdits(adds,updates,deletes);
       ok.forEach(d=>{d.m.fsRemoteId=d.m.meta.id;d.m.fsSig=d.sig;delete d.m.fsConflict;n++;});
     }
+    }
     fsLastSync=new Date();fsDirty=false;
     if(errors.length)fsSetStatus('Niet alles gesynchroniseerd: '+errors.join('; '),'err');
     else fsSetStatus('Gesynchroniseerd '+fsLastSync.toLocaleTimeString('nl-NL',{hour:'2-digit',minute:'2-digit'})+(n?' ('+n+' meting(en) bijgewerkt)':''),'ok');
@@ -8745,7 +8964,16 @@ function fsReplaceMeetings(arr){
   activeKeys={};activeCompareKeys={};
   closeDetail();closeEdit();
 }
-function fsHasUnsynced(){return meetings.some(m=>((m.pts&&m.pts.length)||m.fsRemoteId)&&m.fsSig!==fsSignature(m))||fsPendingDeletes.length>0;}
+function fsHasUnsynced(){
+  if(fsSchema==='ps'){
+    if(fsPendingDeletes.length||meetings.some(m=>!m.fsKey&&m.pts&&m.pts.length))return true;
+    let un=false;
+    fsPsGroups().forEach(g=>{const sig=fsHash(JSON.stringify(fsPsDesired(g)));if([g.in,g.uit].filter(Boolean).some(m=>m.fsSig!==sig))un=true;});
+    return un;
+  }
+  return fsHasUnsyncedTemplate();
+}
+function fsHasUnsyncedTemplate(){return meetings.some(m=>((m.pts&&m.pts.length)||m.fsRemoteId)&&m.fsSig!==fsSignature(m))||fsPendingDeletes.length>0;}
 async function fsConnect(opts){
   opts=opts||{};
   fsCfg.url=String(fsCfg.url||'').trim();
@@ -8762,17 +8990,26 @@ async function fsConnect(opts){
     }else throw e;
   }
   const mp=fsMapFields(meta);
-  if(mp.missing.length)throw new Error('Deze kolommen ontbreken in de tabel: '+mp.missing.map(k=>FS_FIELD_DEFS[k][0]).join(', ')+'. Verwacht worden de kolommen van de CSV-template (MeetingID, Afstand_m, BovenkantBagger_cm, VasteBodem_cm, …).');
-  fsF=mp.map;fsTypes=mp.types;fsOid=mp.oid;fsMissingOptional=mp.optionalMissing;
+  if(mp.map.id){
+    if(mp.missing.length)throw new Error('Deze kolommen ontbreken in de tabel: '+mp.missing.map(k=>FS_FIELD_DEFS[k][0]).join(', ')+'. Verwacht worden de kolommen van de CSV-template (MeetingID, Afstand_m, BovenkantBagger_cm, VasteBodem_cm, …).');
+    fsSchema='template';fsF=mp.map;fsTypes=mp.types;fsOid=mp.oid;fsMissingOptional=mp.optionalMissing;
+  }else{
+    const ps=fsMapFieldsPS(meta);
+    if(ps.missing.length)throw new Error('Deze kolommen ontbreken in de tabel: '+ps.missing.map(k=>FS_PS_DEFS[k][0].toUpperCase()).join(', ')+'. Verwacht worden AFSTAND, BAG_DIEP, VASTE_BODEM (en Bagger_diepte_uitpeilen_cm) — of de kolommen van de CSV-template.');
+    fsSchema='ps';fsPsCols=ps.map;fsPsMeta=ps.metaCols;fsTypes=ps.types;fsOid=ps.oid;fsMissingOptional=ps.optionalMissing;
+  }
+  fsFillKeySelect(meta);
   const cap=String(meta.capabilities||'');
   const lack=['Create','Update','Delete'].filter(c=>!new RegExp(c,'i').test(cap));
   fsCanEdit=!lack.length;
   fsPageSize=Math.min(meta.maxRecordCount||1000,2000);
   const feats=await fsQueryAll('1=1');
-  const remote=fsBuildMeetings(feats);
+  if(fsSchema==='ps')fsResolveKey(meta,feats);
+  const remote=fsBuildAny(feats);
   let keepLocal=false;
   if(meetings.length){
     if(!remote.length){
+      if(fsSchema==='ps')throw new Error('De tabel is leeg. Nieuwe profielen uploaden naar een PS_Dwarsprofiel-tabel wordt niet ondersteund — de lokale metingen blijven staan maar worden niet verstuurd. Verwijder ze eerst of vul de tabel.');
       if(!fsCanEdit)throw new Error('De tabel is leeg en niet bewerkbaar — er is niets om te laden.');
       if(!confirm('De tabel in de feature service is leeg. De '+meetings.length+' meting(en) die nu in de tool staan uploaden?'))throw new Error('Verbinden geannuleerd.');
       meetings.forEach(m=>{delete m.fsRemoteId;delete m.fsSig;delete m.fsConflict;});
@@ -8786,8 +9023,9 @@ async function fsConnect(opts){
   fsConnected=true;
   fsLastSync=new Date();fsDirty=false;
   renderAll();
-  let msg=keepLocal?'Verbonden — lokale metingen worden geüpload.':'Verbonden: '+remote.length+' meting(en) geladen uit de feature service.';
+  let msg=keepLocal?'Verbonden — lokale metingen worden geüpload.':'Verbonden: '+remote.length+' meting(en) geladen uit de feature service'+(fsSchema==='ps'?' (profielen gegroepeerd op veld '+fsKeyField+')':'')+'.';
   if(!fsCanEdit)msg+=' LET OP: alleen lezen (ontbrekende rechten op de laag: '+lack.join(', ')+').';
+  if(fsSchema==='ps')msg+=' Opnamepeil, legger-/onderhoudsdiepte en coördinaten staan niet in deze tabel: vul ze in de tool in (worden niet opgeslagen) als je ze nodig hebt.';
   if(fsMissingOptional.length)msg+=' Niet opgeslagen omdat de kolom ontbreekt: '+fsMissingOptional.map(k=>FS_OPTIONAL_LABELS[k]).join(', ')+'.';
   fsSetStatus(fsCanEdit?'Verbonden · '+remote.length+' meting(en)':'Verbonden (alleen lezen)',fsCanEdit?'ok':'err');
   if(keepLocal)fsScheduleSync();
@@ -8797,7 +9035,7 @@ async function fsReload(){
   if(!fsConnected)throw new Error('Niet verbonden.');
   if(fsHasUnsynced()&&!confirm('Er zijn nog niet-gesynchroniseerde wijzigingen. Opnieuw laden vervangt alles door de data uit de feature service. Doorgaan?'))return null;
   fsSetStatus('Laden…','busy');
-  const remote=fsBuildMeetings(await fsQueryAll('1=1'));
+  const remote=fsBuildAny(await fsQueryAll('1=1'));
   fsLoading=true;
   try{fsPendingDeletes=[];fsReplaceMeetings(remote);}finally{fsLoading=false;}
   fsDirty=false;renderAll();
@@ -8826,6 +9064,7 @@ function fsOpenDialog(){
   document.getElementById('fs-portal').value=fsCfg.portal;
   document.getElementById('fs-token').value='';
   document.getElementById('fs-auto').checked=!!fsCfg.autoSync;
+  fsFillKeySelect(null);
   document.getElementById('fs-redirect').textContent=location.origin+location.pathname;
   fsDialogMsg(fsConnected?'Verbonden.':'Nog niet verbonden.','');
   document.getElementById('fs-overlay').style.display='block';
@@ -8836,6 +9075,7 @@ function fsReadDialog(){
   fsCfg.clientId=document.getElementById('fs-client').value.trim();
   fsCfg.portal=document.getElementById('fs-portal').value.trim()||FS_DEFAULT_PORTAL;
   fsCfg.autoSync=document.getElementById('fs-auto').checked;
+  fsCfg.keyField=document.getElementById('fs-key').value||'';
   const t=document.getElementById('fs-token').value.trim();
   if(t){fsCfg.token=t;fsCfg.tokenExp=0;fsSaveToken();}
   fsSaveCfg();
