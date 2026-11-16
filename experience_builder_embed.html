@@ -200,7 +200,8 @@ input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var
   <button class="btn btn-sm" onclick="fsOpenDialog()" title="Metingen rechtstreeks lezen uit en terugschrijven naar een tabel van een ArcGIS feature service"><i class="ti ti-database" aria-hidden="true"></i>Feature service</button>
   <div style="flex:1"></div>
   <span id="fs-indicator" style="font-size:11px;color:var(--text-m);margin-right:10px">Feature service: niet verbonden</span>
-  <span id="autosave-indicator" style="font-size:11px;color:var(--text-m)" title="De tool slaat wijzigingen automatisch op in deze browser, zodat een herlaad (F5) of ongeluk niets kost. Voor delen met collega's of een andere computer: gebruik 'Project opslaan'.">Nog niet automatisch opgeslagen</span>
+  <span id="autosave-indicator" style="font-size:11px;color:var(--text-m)" title="Automatisch opslaan in deze browser is uitgeschakeld. Gebruik Project opslaan om je werk handmatig te bewaren.">Auto-save uit</span>
+  <button class="btn btn-sm btn-danger" onclick="wisOpgeslagenGeschiedenis()" title="Verwijdert de eerder automatisch opgeslagen browsersessie. De metingen die nu openstaan blijven behouden."><i class="ti ti-trash" aria-hidden="true"></i>Geschiedenis wissen</button>
 </div>
 
 <div class="tab-bar no-print">
@@ -3817,13 +3818,10 @@ function herstelProjectSnapshot(staat){
   closeDetail();closeEdit(); // sluit een eventueel open detail-/bewerkvenster ook echt (anders blijven verouderde cijfers zichtbaar totdat je het opnieuw opent)
   renderAll();
 }
-let _autosaveTimer=null;
-let _autosaveGereed=false; // pas true na de opstart-herstelpoging, voorkomt dat de allereerste (nog lege) render de zojuist herstelde sessie overschrijft
+// Browser-auto-save is bewust uitgeschakeld. Feature Service-synchronisatie blijft
+// apart werken en wordt hier niet uitgeschakeld.
 function scheduleAutosave(){
   if(typeof fsScheduleSync==='function')fsScheduleSync();
-  if(!_autosaveGereed)return;
-  if(_autosaveTimer)clearTimeout(_autosaveTimer);
-  _autosaveTimer=setTimeout(()=>{_autosaveTimer=null;autosaveNu();},800);
 }
 async function autosaveNu(){
   try{
@@ -3865,7 +3863,23 @@ async function wisAutosave(){
       tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);
     });
     db.close();
-  }catch(e){console.error('Automatisch opgeslagen sessie wissen mislukt:',e);}
+    return true;
+  }catch(e){
+    console.error('Eerder opgeslagen browsersessie wissen mislukt:',e);
+    return false;
+  }
+}
+async function wisOpgeslagenGeschiedenis(){
+  if(!confirm('De eerder opgeslagen browsersessie wissen? De metingen die nu in de tool openstaan en de gegevens in de Feature Service worden niet verwijderd.'))return;
+  const result=await wisAutosave();
+  const ind=document.getElementById('autosave-indicator');
+  if(result){
+    if(ind)ind.textContent='Opgeslagen geschiedenis gewist · auto-save uit';
+    showMsg('De eerder opgeslagen browsersessie is gewist. De huidige metingen zijn behouden.','ok');
+  }else{
+    if(ind)ind.textContent='Wissen mislukt';
+    showMsg('De opgeslagen browsersessie kon niet worden gewist. Controleer de browserconsole.','err');
+  }
 }
 // Bij het openen van de tool: kijk of er een automatisch opgeslagen sessie is (bijv. na
 // een herlaad/crash) en herstel die stilzwijgend — dat is precies het "F5-probleem" dat
@@ -9113,7 +9127,8 @@ async function fsInit(){
 
 if(!window.__fsOauthPopup){
   renderAll();
-  probeerAutosaveTeHerstellen().then(fsInit);
+  // Geen automatische browsersessie meer herstellen; laden en opslaan gebeurt handmatig.
+  fsInit();
 }
 </script>
 </body>
